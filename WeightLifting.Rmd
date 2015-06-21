@@ -1,0 +1,114 @@
+---
+title: "Weight Lifting Data Analysis"
+author: "Marisa Gioioso"
+date: "June 21, 2015"
+output: html_document
+---
+### Executive Summary
+The purpose of this analysis was to determine an effective predictive model for whether a user with an activity monitor was correctly performing a dumbell curl at the gym. The user was equipped with activity monitors on his belt, lower arm, upper arm, and the dumbell itself. During this controlled experiment, a trainer instructed the user to do a sequence of repetitions correctly (in the data corresponding to classe A), or a number of incorrect ways (classes B-E). Our analysis below shows that based on 43 of the given 160 variables, a random forest model can predict which class (A-E) a given activity is a member of. This was achieved with 98% accuracy on a cross-validation set, and 100% accuracy on the final 20-point test set.
+
+### Preprocessing
+A significant proportion of the analysis was figuring out what columns and rows contained little information and so could be excluded. There was a significant number of N/A values in many of the columns, which made for an easy decision to exclude them. Also, several of the columns in the training set (with *new_window* = "yes") were summary rows of a sequence of repetitions. Since these rows were not part of the test set, it was not appropriate to train on these either. Finally, the identification columns were removed, such as user_name, the time stamps, and the window columns. If included, the model would train on (in the case of time stamps and windows) features that are irrelevant to exercise performance. Including the user_name will cause the model to possibly work very well on the same user_name if it comes up in the test set, but would be useless otherwise.
+
+```{r, message=FALSE}
+library(caret)
+#library(doParallel) # this introduced a severe memory leak on my computer!
+
+training <- read.csv("pml-training.csv", na.strings=c("NA","","#DIV/0!"))
+testing <- read.csv("pml-testing.csv", na.strings=c("NA","","#DIV/0!"))
+
+# get rid of columns with just NAs
+nas <- colSums(is.na(training))
+naIds <- which(nas > 1900)
+
+summaryRows <- which(training$new_window=="yes")
+
+clean_train <- training[,-naIds]
+clean_train <- clean_train[-summaryRows,]
+
+# remove the metadata which will cause overfitting to nongeneralized features
+# ie. username, time, etc
+clean_train <- clean_train[,8:ncol(clean_train)]
+ncol(clean_train)
+```
+
+So far the number of columns has been reduced to `r ncol(clean_train)`, based on the most obvious data issues. The resulting set of columns may work perfectly fine with a Random Forest but may just take even longer to run, which is an issue with random forests. So in the interest of efficiency on my dinky computer, let's find some more columns to omit. One way to do this is to identify the columns that are most correlated with one another. If they are highly correlated, than in a random forest calculation, they are redundant. The correlation matrix is generated below for all of the columns, and for each column, if there is a later column that is highly correlated with it, the later column is removed.
+
+```{r}
+# look at correlation of the different columns to see if we can remove some more
+corMat <- cor(clean_train[,-53])
+keep <- matrix(TRUE, ncol(clean_train))
+nums <- 1:ncol(corMat)
+
+# If any later columns are more than .8 correlated with this column, then
+# remove them from the final list
+for (i in 1:ncol(corMat)) {
+    highCor <- which((nums>i) & (corMat[i,]>.8))
+    if (length(highCor)>0) {
+        cat("Column ", i, " is highly correlated with columns ", highCor,
+            ", that will be removed\n")
+    }
+    keep[highCor] <- FALSE
+}
+trainSub <- clean_train[,which(keep)]
+ncol(trainSub)
+```
+
+Now the number of included columns has been reduced to `r ncol(trainSub)`.
+
+### Prediction Model and Results
+As a first step, let's demonstrate a direct call to the random forest model. In order to make the processing manageable on a laptop, the number of trees was reduced to 200. The training data was partitioned into a training set and a cross-validation set for us to evaluate with.
+
+```{r, cache=TRUE, message=FALSE}
+library(randomForest)
+inTrain <- createDataPartition(trainSub$classe, p=.75, list=FALSE)
+trainSubSmall <- trainSub[inTrain,]
+cvSubSmall <- trainSub[-inTrain,]
+
+rf1 <- randomForest(classe~., data=trainSubSmall, importance=TRUE, ntree=200)
+cm <- confusionMatrix(predict(rf1, cvSubSmall[,-ncol(cvSubSmall)]), 
+                cvSubSmall[,ncol(cvSubSmall)])
+cm$overall[1]
+cm$table
+```
+
+Here we can see that the random forest has an out-of-sample accuracy of `r cm$overall[[1]]`. But since this estimate is based on just one CV set, it is likely to be biased high. In order to correct the bias, a k-fold cross-validation is performed with a **k** of 5. A k of 10 is standard, but in the interest of the poor computing environment, 5 will need to be used here. The caret::train method can do this kind of cross validation during the tree selection process, but it is extremely processor and memory intensive. In earlier exploratory analysis, this method was used on a small fraction of the training set (p=.05), but this produced a random forest with much lower accuracy. Instead, we can do the cross-validation manually, as below.
+
+```{r, cache=TRUE}
+folds <- createFolds(trainSub$classe, k=5, list=TRUE, returnTrain=TRUE)
+accs = (1:5)*0
+for (i in 1:5) {
+    ftrain <- trainSub[folds[[i]],]
+    fcv <- trainSub[-folds[[i]],]
+    rf <- randomForest(classe~., data=ftrain, importance=TRUE, ntree=200)
+    cm <- confusionMatrix(predict(rf, fcv[,-ncol(fcv)]), 
+                          fcv[,ncol(fcv)])
+    accs[i] <- cm$overall[1]
+}
+totAcc <- mean(accs)
+```
+
+```{r}
+totAcc
+```
+
+In this case the 5-fold cross validation yielded an estimate of accuracy equivalent to the single out-of-sample, which means that the random forest operation did a good job to not overfit the data.  When this random forest was then applied to the test set, it yielded a perfect prediction on all 20 test data points, per the results of the online automated grader.
+
+As a visualization of the error explained above, the following plot shows how the accuracy changed with the number of trees. It appears that we could have used even fewer than 50 trees and still gotten the same result.
+
+```{r, message=FALSE}
+library(randomForest)
+plot(rf1)
+```
+
+As a final observation, the features that contained the most information, and partitioned the data in the purest way, were the following:
+```{r}
+imp <- importance(rf1)
+importanceOrdered <- imp[order(-imp[,6]), ]
+importanceOrdered[1:10,1]
+```
+
+In this set of the top 5 features, each sensor (belt, dumbell, forearm, and arm) is represented by at least one feature, which is reasonable given where the sensors are and the incorrect postures they are supposed to predict.
+
+### Conclusion
+We successfully created a prediction model that had 99% out-of-sample accuracy to predict whether a user was performing a dumbell curl correctly in a controlled environment. In fact this function is already incorprated into existing products on the market, but in a non-controlled experimental environment like the one this data comes from, the accuracy would surely be a lot lower, introducing many more false positives and false negatives.
